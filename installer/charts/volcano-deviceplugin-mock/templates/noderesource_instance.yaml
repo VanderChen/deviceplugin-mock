@@ -129,6 +129,33 @@ spec:
 apiVersion: dpmock.volcano.sh/v1alpha1
 kind: NodeResource
 metadata:
+  name: ascend-d950
+spec:
+  resourceName: huawei.com/ascend-1980
+  deviceIDGeneratePolicy:
+    prefix:
+      static:
+        - davinci
+    delimiter: ""
+    ordinalStart: 0
+  defaultNodePatchTemplate: |
+    metadata:
+      annotations:{{ `
+        {{- $num_list := atoi .capacity | until }}
+        {{- $hccs_list := join "," $num_list | list }}
+        {{- $sio_list := list }}
+        {{- range $i, $e := chunk 2 $num_list }}
+        {{- $sio_list = join "," $e | append $sio_list }}
+        {{- end }}
+        volcano.sh/device-topologys: '{"topologys":[{"type":"HCCS","groups":{{ toJson $hccs_list }}},{"type":"SIO","groups":{{ toJson $sio_list }}}]}'` }}
+  defaultNodeUndoPatch: |
+    metadata:
+      annotations:
+        volcano.sh/device-topologys: null
+---
+apiVersion: dpmock.volcano.sh/v1alpha1
+kind: NodeResource
+metadata:
   name: ascend-d310
 spec:
   resourceName: huawei.com/ascend-310

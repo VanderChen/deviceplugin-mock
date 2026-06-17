@@ -26,4 +26,4 @@ daemon:
       cpu: "0.2"
       memory: 200Mi
 
-customized: "daemon-ascend daemon-ascend-d910 daemon-ascend-common"
+customized: "daemon-ascend daemon-ascend-d910 daemon-ascend-d950 daemon-ascend-common"

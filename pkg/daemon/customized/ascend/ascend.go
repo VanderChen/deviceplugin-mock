@@ -43,6 +43,7 @@ func init() {
 		podModifyMethods: map[string]func(pod *v1.Pod, pr *podmonitor.PodResource) error{
 			common.Name(): common.ModifyPod,
 			d910.Name():   d910.ModifyPod,
+			d950.Name():   d950.ModifyPod,
 		},
 	}
 	framework.RegisterService(ascend)

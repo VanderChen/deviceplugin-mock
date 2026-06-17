@@ -18,7 +18,8 @@ package ascend
 
 import (
 	"context"
-	"slices"
+	"sort"
+	"strconv"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -86,9 +87,20 @@ func (a *AscendCommon) getDeviceIDs(resources map[string][]string) ([]string, bo
 		if ok {
 			ids := make([]string, len(deviceIDs))
 			copy(ids, deviceIDs)
-			slices.Sort(ids)
+			sortDeviceIDs(ids)
 			return ids, true
 		}
 	}
 	return nil, false
+}
+
+func sortDeviceIDs(ids []string) {
+	sort.Slice(ids, func(i, j int) bool {
+		iIdx, iErr := strconv.Atoi(strings.TrimPrefix(ids[i], devPrefix))
+		jIdx, jErr := strconv.Atoi(strings.TrimPrefix(ids[j], devPrefix))
+		if iErr == nil && jErr == nil {
+			return iIdx < jIdx
+		}
+		return ids[i] < ids[j]
+	})
 }

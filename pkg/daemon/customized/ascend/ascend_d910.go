@@ -84,6 +84,9 @@ func (a *AscendD910) ModifyPod(pod *v1.Pod, pr *podmonitor.PodResource) error {
 	if !a.Enabled {
 		return nil
 	}
+	if activeConfigReferencesNodeResource("ascend-d950") {
+		return nil
+	}
 
 	deviceIDs, ok := pr.Resources[resourceName]
 	if !ok {
@@ -113,9 +116,13 @@ func (a *AscendD910) ModifyPod(pod *v1.Pod, pr *podmonitor.PodResource) error {
 }
 
 func buildPodNetworkInfoJson(podName string, deviceIDs []string, requiredDeviceIP, requiredSuperDeviceID bool) (string, error) {
+	return buildPodNetworkInfoJsonWithServerID(podName, framework.GetEnvs().NodeName, deviceIDs, requiredDeviceIP, requiredSuperDeviceID)
+}
+
+func buildPodNetworkInfoJsonWithServerID(podName, serverID string, deviceIDs []string, requiredDeviceIP, requiredSuperDeviceID bool) (string, error) {
 	info := &PodNetworkInfo{
 		PodName:  podName,
-		ServerID: framework.GetEnvs().NodeName,
+		ServerID: serverID,
 	}
 	for _, id := range deviceIDs {
 		idx, err := strconv.Atoi(strings.TrimPrefix(id, devPrefix))
@@ -136,6 +143,11 @@ func buildPodNetworkInfoJson(podName string, deviceIDs []string, requiredDeviceI
 		info.Devices = append(info.Devices, networkInfo)
 	}
 	sort.Slice(info.Devices, func(i, j int) bool {
+		iIdx, iErr := strconv.Atoi(info.Devices[i].DeviceID)
+		jIdx, jErr := strconv.Atoi(info.Devices[j].DeviceID)
+		if iErr == nil && jErr == nil {
+			return iIdx < jIdx
+		}
 		return info.Devices[i].DeviceID < info.Devices[j].DeviceID
 	})
 

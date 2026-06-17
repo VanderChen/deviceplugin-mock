@@ -22,8 +22,9 @@ import (
 )
 
 type Envs struct {
-	NodeName string
-	NodeIP   string
+	NodeName     string
+	NodeIP       string
+	PodNamespace string
 }
 
 var envs Envs
@@ -44,6 +45,7 @@ func initializeEnvironment() error {
 
 	envs.NodeName = nodeName
 	envs.NodeIP = nodeIP
+	envs.PodNamespace = os.Getenv("POD_NAMESPACE")
 
 	return nil
 }
