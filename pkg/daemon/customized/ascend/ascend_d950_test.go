@@ -31,12 +31,19 @@ import (
 )
 
 func TestAscendD950ModifyPod(t *testing.T) {
+	framework.GetEnvs().NodeName = "kind-worker2"
 	framework.GetEnvs().NodeIP = "192.168.7.100"
 	d950.Enabled = true
+	d950.kubeClient = fake.NewSimpleClientset(
+		node("kind-control-plane", true),
+		node("kind-worker", false),
+		node("kind-worker2", false),
+	)
 	oldD950ConfigActive := d950ConfigActive
 	d950ConfigActive = func() bool { return true }
 	defer func() {
 		d950.Enabled = false
+		d950.kubeClient = nil
 		d950ConfigActive = oldD950ConfigActive
 	}()
 
@@ -61,6 +68,9 @@ func TestAscendD950ModifyPod(t *testing.T) {
 	if got, want := pod.Annotations[visibleDevicesKey], "Ascend910-0,Ascend910-1"; got != want {
 		t.Fatalf("annotation %s = %q, want %q", visibleDevicesKey, got, want)
 	}
+	if got, want := pod.Annotations[ascendRealPhyIDKey], "Ascend910-8,Ascend910-9"; got != want {
+		t.Fatalf("annotation %s = %q, want %q", ascendRealPhyIDKey, got, want)
+	}
 
 	wantNetworkInfo := `{"pod_name":"deployment1-6c49f95d74-kswdl","server_id":"192.168.7.100","devices":[{"device_id":"0","super_device_id":"10000","device_ip":"100.0.0.0","tor_ip":"200.0.0.0","tor_port":"8888"},{"device_id":"1","super_device_id":"10000","device_ip":"100.0.0.1","tor_ip":"200.0.0.1","tor_port":"8888"}]}`
 	if got := pod.Annotations[annotationKey]; got != wantNetworkInfo {
@@ -69,7 +79,7 @@ func TestAscendD950ModifyPod(t *testing.T) {
 }
 
 func TestBuildRootInfoPayload(t *testing.T) {
-	payload, err := buildRootInfoPayload()
+	payload, err := buildRootInfoPayload(16)
 	if err != nil {
 		t.Fatalf("buildRootInfoPayload() error = %v", err)
 	}
@@ -90,6 +100,14 @@ func TestBuildRootInfoPayload(t *testing.T) {
 	if got, want := len(info.RankList), d950CardCount; got != want {
 		t.Fatalf("rank_list length = %d, want %d", got, want)
 	}
+	for idx, rank := range info.RankList {
+		if got, want := rank.DeviceID, idx; got != want {
+			t.Fatalf("rank[%d].device_id = %d, want %d", idx, got, want)
+		}
+		if got, want := rank.LocalID, 16+idx; got != want {
+			t.Fatalf("rank[%d].local_id = %d, want %d", idx, got, want)
+		}
+	}
 	if err = validateUniqueRootInfoAddrs(info); err != nil {
 		t.Fatalf("validateUniqueRootInfoAddrs() error = %v", err)
 	}
@@ -100,7 +118,11 @@ func TestAscendD950SyncRootInfoConfigMap(t *testing.T) {
 	framework.GetEnvs().NodeIP = "172.18.0.2"
 	framework.GetEnvs().PodNamespace = "volcano-system"
 
-	client := fake.NewSimpleClientset()
+	client := fake.NewSimpleClientset(
+		node("kind-control-plane", true),
+		node("kind-worker", false),
+		node("kind-worker2", false),
+	)
 	svc := &AscendD950{Enabled: true, kubeClient: client}
 	oldD950ConfigActive := d950ConfigActive
 	d950ConfigActive = func() bool { return true }
@@ -119,7 +141,109 @@ func TestAscendD950SyncRootInfoConfigMap(t *testing.T) {
 	if got, want := cm.Labels["dpmock.volcano.sh/mock-spec"], "ascend-d950"; got != want {
 		t.Fatalf("mock-spec label = %q, want %q", got, want)
 	}
+	if got, want := cm.Labels["ring-controller.cce"], "ascend-1980"; got != want {
+		t.Fatalf("ring-controller label = %q, want %q", got, want)
+	}
+	if got, want := cm.Labels["volcano.sh/config-type"], "root-info"; got != want {
+		t.Fatalf("config-type label = %q, want %q", got, want)
+	}
 	if cm.Data[d950RootInfoKey] == "" {
 		t.Fatalf("ConfigMap data %q is empty", d950RootInfoKey)
+	}
+
+	info := &rootInfo{}
+	if err = json.Unmarshal([]byte(cm.Data[d950RootInfoKey]), info); err != nil {
+		t.Fatalf("failed to unmarshal rootinfo payload: %v", err)
+	}
+	if got, want := info.RankList[0].DeviceID, 0; got != want {
+		t.Fatalf("rank[0].device_id = %d, want %d", got, want)
+	}
+	if got, want := info.RankList[0].LocalID, 0; got != want {
+		t.Fatalf("rank[0].local_id = %d, want %d", got, want)
+	}
+	if got, want := info.RankList[7].LocalID, 7; got != want {
+		t.Fatalf("rank[7].local_id = %d, want %d", got, want)
+	}
+}
+
+func TestAscendD950DeletesRootInfoConfigMapWhenInactive(t *testing.T) {
+	framework.GetEnvs().NodeName = "kind-worker"
+	framework.GetEnvs().NodeIP = "172.18.0.2"
+	framework.GetEnvs().PodNamespace = "volcano-system"
+
+	client := fake.NewSimpleClientset(&v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rootinfo-172.18.0.2",
+			Namespace: "volcano-system",
+		},
+		Data: map[string]string{
+			d950RootInfoKey: "{}",
+		},
+	})
+	svc := &AscendD950{Enabled: true, kubeClient: client}
+	oldD950ConfigActive := d950ConfigActive
+	d950ConfigActive = func() bool { return false }
+	defer func() {
+		d950ConfigActive = oldD950ConfigActive
+	}()
+
+	svc.syncRootInfoConfigMap(context.Background())
+
+	_, err := client.CoreV1().ConfigMaps("volcano-system").Get(context.Background(), "rootinfo-172.18.0.2", metav1.GetOptions{})
+	if err == nil {
+		t.Fatalf("rootinfo ConfigMap still exists after inactive D950 sync")
+	}
+}
+
+func TestCurrentNodeLocalIDStart(t *testing.T) {
+	framework.GetEnvs().NodeName = "kind-worker2"
+	client := fake.NewSimpleClientset(
+		node("kind-control-plane", true),
+		node("kind-worker", false),
+		node("kind-worker2", false),
+	)
+
+	got, err := currentNodeLocalIDStart(context.Background(), client)
+	if err != nil {
+		t.Fatalf("currentNodeLocalIDStart() error = %v", err)
+	}
+	if want := 8; got != want {
+		t.Fatalf("currentNodeLocalIDStart() = %d, want %d", got, want)
+	}
+}
+
+func TestCurrentNodeLocalIDStartWrapsAfterEightNodes(t *testing.T) {
+	framework.GetEnvs().NodeName = "node-08"
+	client := fake.NewSimpleClientset(
+		node("node-00", false),
+		node("node-01", false),
+		node("node-02", false),
+		node("node-03", false),
+		node("node-04", false),
+		node("node-05", false),
+		node("node-06", false),
+		node("node-07", false),
+		node("node-08", false),
+	)
+
+	got, err := currentNodeLocalIDStart(context.Background(), client)
+	if err != nil {
+		t.Fatalf("currentNodeLocalIDStart() error = %v", err)
+	}
+	if want := 0; got != want {
+		t.Fatalf("currentNodeLocalIDStart() = %d, want %d", got, want)
+	}
+}
+
+func node(name string, controlPlane bool) *v1.Node {
+	labels := map[string]string{}
+	if controlPlane {
+		labels["node-role.kubernetes.io/control-plane"] = ""
+	}
+	return &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: labels,
+		},
 	}
 }

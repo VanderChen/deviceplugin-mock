@@ -35,8 +35,9 @@ type Controller struct {
 	nodeLister  corev1.NodeLister
 	nrcfgLister dpmockv1alpha1.NodeResourceConfigurationLister
 
-	synchronized atomic.Bool
-	managers     map[string]resourceManagerWithCancel
+	synchronized   atomic.Bool
+	managers       map[string]resourceManagerWithCancel
+	staleResources map[string]struct{}
 }
 
 type resourceManagerWithCancel struct {
@@ -77,6 +78,7 @@ func (c *Controller) KubeClientInit(clientSet framework.ClientSet) error {
 func (c *Controller) Initialize() error {
 	c.synchronized.Store(false)
 	c.managers = make(map[string]resourceManagerWithCancel)
+	c.staleResources = make(map[string]struct{})
 
 	clientSet := framework.GetClientSet()
 	c.nodeLister = clientSet.KubeInformerFactory.Core().V1().Nodes().Lister()

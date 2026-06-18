@@ -57,6 +57,13 @@ func (c *Controller) syncConfigOnce(ctx context.Context) error {
 		return nrcfgList[i].CreationTimestamp.Before(&nrcfgList[j].CreationTimestamp)
 	})
 
+	knownResourceNames := make(map[string]struct{})
+	for _, nrcfg := range nrcfgList {
+		for _, desc := range nrcfg.Status.ResourceDescriptions {
+			knownResourceNames[desc.ResourceName] = struct{}{}
+		}
+	}
+
 	for _, nrcfg := range nrcfgList {
 		var selector labels.Selector
 		selector, err = metav1.LabelSelectorAsSelector(nrcfg.Spec.NodeSelector)
@@ -65,16 +72,16 @@ func (c *Controller) syncConfigOnce(ctx context.Context) error {
 			continue
 		}
 		if selector.Matches(labels.Set(node.Labels)) {
-			c.applyConfig(ctx, nrcfg)
+			c.applyConfig(ctx, nrcfg, knownResourceNames)
 			return nil // apply first config only
 		}
 	}
 
-	c.applyConfig(ctx, nrcfgEmpty)
+	c.applyConfig(ctx, nrcfgEmpty, knownResourceNames)
 	return nil
 }
 
-func (c *Controller) applyConfig(ctx context.Context, nrcfg *dpmockv1alpha1.NodeResourceConfiguration) {
+func (c *Controller) applyConfig(ctx context.Context, nrcfg *dpmockv1alpha1.NodeResourceConfiguration, knownResourceNames map[string]struct{}) {
 	klog.V(3).InfoS("applying NodeResourceConfiguration for current node", "nrcfg", nrcfg.Name)
 	defer klog.V(3).InfoS("apply NodeResourceConfiguration for current node finished", "nrcfg", nrcfg.Name)
 
@@ -87,8 +94,31 @@ func (c *Controller) applyConfig(ctx context.Context, nrcfg *dpmockv1alpha1.Node
 	for name, manager := range c.managers {
 		if _, ok := resDescMap[name]; !ok {
 			klog.V(3).InfoS("clean up resource", "name", name)
+			c.staleResources[name] = struct{}{}
 			manager.Cancel()
 			delete(c.managers, name)
+		}
+	}
+
+	for name := range knownResourceNames {
+		if _, ok := resDescMap[name]; ok {
+			continue
+		}
+		c.staleResources[name] = struct{}{}
+	}
+
+	for name := range c.staleResources {
+		if _, ok := resDescMap[name]; ok {
+			delete(c.staleResources, name)
+			continue
+		}
+		absent, err := resmanager.CleanupNodeStatusResource(ctx, name)
+		if err != nil {
+			klog.ErrorS(err, "failed to clean stale resource from node status", "name", name)
+			continue
+		}
+		if absent {
+			delete(c.staleResources, name)
 		}
 	}
 

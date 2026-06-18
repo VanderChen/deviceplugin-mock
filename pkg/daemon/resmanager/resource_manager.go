@@ -18,11 +18,13 @@ package resmanager
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
 	"sync/atomic"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -129,6 +131,9 @@ func (m *resourceManager) onExit() {
 			klog.V(3).InfoS("resource undo patch to node success", "resourceName", m.resourceName, "undoPatch", desc.NodeUndoPatch)
 		}
 	}
+	if err := ensureNodeStatusResourceRemoved(framework.ContextOnExit(), m.resourceName); err != nil {
+		klog.ErrorS(err, "resource cleanup from node status failed", "resourceName", m.resourceName)
+	}
 }
 
 func patchToNode(ctx context.Context, patch []byte) error {
@@ -146,4 +151,59 @@ func patchToNode(ctx context.Context, patch []byte) error {
 	klog.V(3).InfoS("patch to node success", "patch", string(jsonPatch))
 
 	return nil
+}
+
+func ensureNodeStatusResourceRemoved(ctx context.Context, resourceName string) error {
+	return wait.PollUntilContextTimeout(ctx, time.Second, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		if _, err := CleanupNodeStatusResource(ctx, resourceName); err != nil {
+			klog.ErrorS(err, "failed to patch node status for resource cleanup", "resourceName", resourceName)
+			return false, nil
+		}
+
+		node, err := framework.GetClientSet().KubeClient.CoreV1().Nodes().Get(ctx, framework.GetEnvs().NodeName, metav1.GetOptions{})
+		if err != nil {
+			klog.ErrorS(err, "failed to get node while checking resource cleanup", "resourceName", resourceName)
+			return false, nil
+		}
+		_, capacityExists := node.Status.Capacity[corev1.ResourceName(resourceName)]
+		_, allocatableExists := node.Status.Allocatable[corev1.ResourceName(resourceName)]
+		return !capacityExists && !allocatableExists, nil
+	})
+}
+
+func CleanupNodeStatusResource(ctx context.Context, resourceName string) (bool, error) {
+	patch, err := buildNodeStatusResourceRemovedPatch(resourceName)
+	if err != nil {
+		return false, err
+	}
+	if _, err = framework.GetClientSet().KubeClient.CoreV1().Nodes().
+		Patch(ctx, framework.GetEnvs().NodeName, types.MergePatchType, patch, metav1.PatchOptions{}, "status"); err != nil {
+		return false, err
+	}
+
+	node, err := framework.GetClientSet().KubeClient.CoreV1().Nodes().Get(ctx, framework.GetEnvs().NodeName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	_, capacityExists := node.Status.Capacity[corev1.ResourceName(resourceName)]
+	_, allocatableExists := node.Status.Allocatable[corev1.ResourceName(resourceName)]
+	return !capacityExists && !allocatableExists, nil
+}
+
+func buildNodeStatusResourceRemovedPatch(resourceName string) ([]byte, error) {
+	patch := map[string]interface{}{
+		"status": map[string]interface{}{
+			"allocatable": map[string]interface{}{
+				resourceName: nil,
+			},
+			"capacity": map[string]interface{}{
+				resourceName: nil,
+			},
+		},
+	}
+	bb, err := json.Marshal(patch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal node status cleanup patch: %w", err)
+	}
+	return bb, nil
 }

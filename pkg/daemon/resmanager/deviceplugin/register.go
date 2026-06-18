@@ -25,6 +25,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/json"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
@@ -77,7 +79,8 @@ func (s *server) deregister(ctx context.Context) error {
 		return fmt.Errorf("failed to marshal patch: %w", err)
 	}
 
-	_, err = framework.GetClientSet().KubeClient.CoreV1().Nodes().PatchStatus(ctx, framework.GetEnvs().NodeName, bb)
+	_, err = framework.GetClientSet().KubeClient.CoreV1().Nodes().
+		Patch(ctx, framework.GetEnvs().NodeName, types.MergePatchType, bb, metav1.PatchOptions{}, "status")
 	if err != nil {
 		return fmt.Errorf("failed to patch node status: %w", err)
 	}

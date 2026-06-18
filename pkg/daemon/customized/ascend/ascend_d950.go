@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -39,15 +40,21 @@ import (
 
 const (
 	d950CardCount               = 8
+	d950RackCardCount           = 64
 	d950RootInfoKey             = "rootinfo.json"
 	d950RootInfoConfigMapPrefix = "rootinfo-"
 	visibleDevicesKey           = "huawei.com/ascend-visible-devices"
+	ascendRealPhyIDKey          = "huawei.com/AscendRealPhyID"
 )
 
 var d950 = &AscendD950{}
 
 var d950ConfigActive = func() bool {
 	return activeConfigReferencesNodeResource("ascend-d950")
+}
+
+var d950LocalIDStart = func(ctx context.Context, kubeClient kubernetes.Interface) (int, error) {
+	return currentNodeLocalIDStart(ctx, kubeClient)
 }
 
 type AscendD950 struct {
@@ -131,6 +138,14 @@ func (a *AscendD950) ModifyPod(pod *v1.Pod, pr *podmonitor.PodResource) error {
 	if err != nil {
 		return err
 	}
+	localIDStart, err := d950LocalIDStart(context.Background(), a.kubeClient)
+	if err != nil {
+		return fmt.Errorf("failed to resolve d950 local id start for pod '%v': %w", pr.NamespacedName, err)
+	}
+	physicalDevices, err := buildPhysicalDevices(ids, localIDStart)
+	if err != nil {
+		return err
+	}
 
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
@@ -139,16 +154,24 @@ func (a *AscendD950) ModifyPod(pod *v1.Pod, pr *podmonitor.PodResource) error {
 	pod.Annotations[ascendRealKey] = idsJoin
 	pod.Annotations[kltDevKey] = idsJoin
 	pod.Annotations[visibleDevicesKey] = visibleDevices
+	pod.Annotations[ascendRealPhyIDKey] = physicalDevices
 
 	return nil
 }
 
 func (a *AscendD950) syncRootInfoConfigMap(ctx context.Context) {
 	if !d950ConfigActive() {
+		a.deleteRootInfoConfigMap(ctx)
 		return
 	}
 
-	payload, err := buildRootInfoPayload()
+	localIDStart, err := d950LocalIDStart(ctx, a.kubeClient)
+	if err != nil {
+		logRootInfoSyncError(err)
+		return
+	}
+
+	payload, err := buildRootInfoPayload(localIDStart)
 	if err != nil {
 		logRootInfoSyncError(err)
 		return
@@ -192,6 +215,18 @@ func (a *AscendD950) syncRootInfoConfigMap(ctx context.Context) {
 	}
 }
 
+func (a *AscendD950) deleteRootInfoConfigMap(ctx context.Context) {
+	name := rootInfoConfigMapName(framework.GetEnvs().NodeIP)
+	namespace := framework.GetEnvs().PodNamespace
+	err := a.kubeClient.CoreV1().ConfigMaps(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	if err != nil {
+		logRootInfoSyncError(err)
+	}
+}
+
 func logRootInfoSyncError(err error) {
 	// Keep rootinfo failures visible without stopping the daemon service loop.
 	if err != nil {
@@ -207,6 +242,18 @@ func buildVisibleDevices(deviceIDs []string) (string, error) {
 			return "", err
 		}
 		devices = append(devices, "Ascend910-"+strconv.Itoa(idx))
+	}
+	return strings.Join(devices, ","), nil
+}
+
+func buildPhysicalDevices(deviceIDs []string, localIDStart int) (string, error) {
+	devices := make([]string, 0, len(deviceIDs))
+	for _, id := range deviceIDs {
+		idx, err := deviceIndexFromID(id)
+		if err != nil {
+			return "", err
+		}
+		devices = append(devices, "Ascend910-"+strconv.Itoa(localIDStart+idx))
 	}
 	return strings.Join(devices, ","), nil
 }
@@ -228,11 +275,13 @@ func rootInfoLabels() map[string]string {
 		"app.kubernetes.io/component": "daemon",
 		"dpmock.volcano.sh/node-name": framework.GetEnvs().NodeName,
 		"dpmock.volcano.sh/mock-spec": "ascend-d950",
+		"ring-controller.cce":         "ascend-1980",
+		"volcano.sh/config-type":      "root-info",
 	}
 }
 
-func buildRootInfoPayload() (string, error) {
-	info := buildRootInfo()
+func buildRootInfoPayload(localIDStart int) (string, error) {
+	info := buildRootInfo(localIDStart)
 	if err := validateUniqueRootInfoAddrs(info); err != nil {
 		return "", err
 	}
@@ -243,19 +292,20 @@ func buildRootInfoPayload() (string, error) {
 	return string(bb), nil
 }
 
-func buildRootInfo() *rootInfo {
+func buildRootInfo(localIDStart int) *rootInfo {
 	info := &rootInfo{
 		Version:   "2.0",
 		Status:    "completed",
 		RankCount: d950CardCount,
 	}
 	for idx := 0; idx < d950CardCount; idx++ {
+		localID := localIDStart + idx
 		info.RankList = append(info.RankList, rootRank{
 			DeviceID: idx,
-			LocalID:  idx,
+			LocalID:  localID,
 			LevelList: []rootLevel{
-				buildTopoFileDescLevel(idx),
-				buildClosLevel(idx),
+				buildTopoFileDescLevel(localID),
+				buildClosLevel(localID),
 			},
 		})
 	}
@@ -322,4 +372,61 @@ func validateUniqueRootInfoAddrs(info *rootInfo) error {
 		}
 	}
 	return nil
+}
+
+func currentNodeLocalIDStart(ctx context.Context, kubeClient kubernetes.Interface) (int, error) {
+	if kubeClient == nil {
+		return 0, errors.New("kube client is nil")
+	}
+
+	nodes, err := kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("failed to list nodes: %w", err)
+	}
+
+	nodeName := framework.GetEnvs().NodeName
+	preferred := filterWorkerNodeNames(nodes.Items)
+	idx := indexOfNode(preferred, nodeName)
+	if idx < 0 {
+		all := nodeNames(nodes.Items)
+		idx = indexOfNode(all, nodeName)
+	}
+	if idx < 0 {
+		return 0, fmt.Errorf("node %q not found", nodeName)
+	}
+
+	return (idx * d950CardCount) % d950RackCardCount, nil
+}
+
+func filterWorkerNodeNames(nodes []v1.Node) []string {
+	names := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
+			continue
+		}
+		if _, ok := node.Labels["node-role.kubernetes.io/master"]; ok {
+			continue
+		}
+		names = append(names, node.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func nodeNames(nodes []v1.Node) []string {
+	names := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		names = append(names, node.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func indexOfNode(names []string, nodeName string) int {
+	for idx, name := range names {
+		if name == nodeName {
+			return idx
+		}
+	}
+	return -1
 }
