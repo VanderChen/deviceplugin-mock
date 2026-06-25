@@ -23,8 +23,10 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"volcano.sh/deviceplugin-mock/pkg/daemon/framework"
 	"volcano.sh/deviceplugin-mock/pkg/daemon/podmonitor"
@@ -68,13 +70,64 @@ func TestAscendD950ModifyPod(t *testing.T) {
 	if got, want := pod.Annotations[visibleDevicesKey], "Ascend910-0,Ascend910-1"; got != want {
 		t.Fatalf("annotation %s = %q, want %q", visibleDevicesKey, got, want)
 	}
-	if got, want := pod.Annotations[ascendRealPhyIDKey], "Ascend910-8,Ascend910-9"; got != want {
+	localIDStart := d950LocalIDStartFromNodeName(framework.GetEnvs().NodeName)
+	wantPhysicalDevices, err := buildPhysicalDevices([]string{"davinci0", "davinci1"}, localIDStart)
+	if err != nil {
+		t.Fatalf("buildPhysicalDevices() error = %v", err)
+	}
+	if got, want := pod.Annotations[ascendRealPhyIDKey], wantPhysicalDevices; got != want {
 		t.Fatalf("annotation %s = %q, want %q", ascendRealPhyIDKey, got, want)
 	}
 
 	wantNetworkInfo := `{"pod_name":"deployment1-6c49f95d74-kswdl","server_id":"192.168.7.100","devices":[{"device_id":"0","super_device_id":"10000","device_ip":"100.0.0.0","tor_ip":"200.0.0.0","tor_port":"8888"},{"device_id":"1","super_device_id":"10000","device_ip":"100.0.0.1","tor_ip":"200.0.0.1","tor_port":"8888"}]}`
 	if got := pod.Annotations[annotationKey]; got != wantNetworkInfo {
 		t.Fatalf("annotation %s = %q, want %q", annotationKey, got, wantNetworkInfo)
+	}
+}
+
+func TestAscendD950DoesNotListNodesForPodAnnotations(t *testing.T) {
+	framework.GetEnvs().NodeName = "kind-worker2"
+	framework.GetEnvs().NodeIP = "192.168.7.100"
+	client := fake.NewSimpleClientset(
+		node("kind-control-plane", true),
+		node("kind-worker", false),
+		node("kind-worker2", false),
+	)
+	nodeListCount := 0
+	client.Fake.PrependReactor("list", "nodes", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		nodeListCount++
+		return false, nil, nil
+	})
+	svc := &AscendD950{Enabled: true, kubeClient: client}
+	oldD950ConfigActive := d950ConfigActive
+	d950ConfigActive = func() bool { return true }
+	defer func() {
+		d950ConfigActive = oldD950ConfigActive
+	}()
+
+	for _, name := range []string{"pod-1", "pod-2"} {
+		pod := &v1.Pod{}
+		pr := &podmonitor.PodResource{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: "default"},
+			Resources: map[string][]string{
+				resourceName: {"davinci0", "davinci1"},
+			},
+		}
+		if err := svc.ModifyPod(pod, pr); err != nil {
+			t.Fatalf("ModifyPod(%s) error = %v", name, err)
+		}
+		localIDStart := d950LocalIDStartFromNodeName(framework.GetEnvs().NodeName)
+		wantPhysicalDevices, err := buildPhysicalDevices([]string{"davinci0", "davinci1"}, localIDStart)
+		if err != nil {
+			t.Fatalf("buildPhysicalDevices() error = %v", err)
+		}
+		if got, want := pod.Annotations[ascendRealPhyIDKey], wantPhysicalDevices; got != want {
+			t.Fatalf("annotation %s = %q, want %q", ascendRealPhyIDKey, got, want)
+		}
+	}
+
+	if want := 0; nodeListCount != want {
+		t.Fatalf("node list count = %d, want %d", nodeListCount, want)
 	}
 }
 
@@ -158,10 +211,11 @@ func TestAscendD950SyncRootInfoConfigMap(t *testing.T) {
 	if got, want := info.RankList[0].DeviceID, 0; got != want {
 		t.Fatalf("rank[0].device_id = %d, want %d", got, want)
 	}
-	if got, want := info.RankList[0].LocalID, 0; got != want {
+	localIDStart := d950LocalIDStartFromNodeName(framework.GetEnvs().NodeName)
+	if got, want := info.RankList[0].LocalID, localIDStart; got != want {
 		t.Fatalf("rank[0].local_id = %d, want %d", got, want)
 	}
-	if got, want := info.RankList[7].LocalID, 7; got != want {
+	if got, want := info.RankList[7].LocalID, localIDStart+7; got != want {
 		t.Fatalf("rank[7].local_id = %d, want %d", got, want)
 	}
 }
@@ -195,43 +249,18 @@ func TestAscendD950DeletesRootInfoConfigMapWhenInactive(t *testing.T) {
 	}
 }
 
-func TestCurrentNodeLocalIDStart(t *testing.T) {
-	framework.GetEnvs().NodeName = "kind-worker2"
-	client := fake.NewSimpleClientset(
-		node("kind-control-plane", true),
-		node("kind-worker", false),
-		node("kind-worker2", false),
-	)
-
-	got, err := currentNodeLocalIDStart(context.Background(), client)
-	if err != nil {
-		t.Fatalf("currentNodeLocalIDStart() error = %v", err)
-	}
-	if want := 8; got != want {
-		t.Fatalf("currentNodeLocalIDStart() = %d, want %d", got, want)
-	}
-}
-
-func TestCurrentNodeLocalIDStartWrapsAfterEightNodes(t *testing.T) {
-	framework.GetEnvs().NodeName = "node-08"
-	client := fake.NewSimpleClientset(
-		node("node-00", false),
-		node("node-01", false),
-		node("node-02", false),
-		node("node-03", false),
-		node("node-04", false),
-		node("node-05", false),
-		node("node-06", false),
-		node("node-07", false),
-		node("node-08", false),
-	)
-
-	got, err := currentNodeLocalIDStart(context.Background(), client)
-	if err != nil {
-		t.Fatalf("currentNodeLocalIDStart() error = %v", err)
-	}
-	if want := 0; got != want {
-		t.Fatalf("currentNodeLocalIDStart() = %d, want %d", got, want)
+func TestD950LocalIDStartFromNodeName(t *testing.T) {
+	for _, name := range []string{"kind-worker", "kind-worker2", "node-08", ""} {
+		got := d950LocalIDStartFromNodeName(name)
+		if got < 0 || got >= d950RackCardCount {
+			t.Fatalf("d950LocalIDStartFromNodeName(%q) = %d, want in [0,%d)", name, got, d950RackCardCount)
+		}
+		if got%d950CardCount != 0 {
+			t.Fatalf("d950LocalIDStartFromNodeName(%q) = %d, want multiple of %d", name, got, d950CardCount)
+		}
+		if again := d950LocalIDStartFromNodeName(name); again != got {
+			t.Fatalf("d950LocalIDStartFromNodeName(%q) is not stable: %d then %d", name, got, again)
+		}
 	}
 }
 

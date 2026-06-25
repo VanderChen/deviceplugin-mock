@@ -20,7 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"hash/fnv"
 	"strconv"
 	"strings"
 	"time"
@@ -51,10 +51,6 @@ var d950 = &AscendD950{}
 
 var d950ConfigActive = func() bool {
 	return activeConfigReferencesNodeResource("ascend-d950")
-}
-
-var d950LocalIDStart = func(ctx context.Context, kubeClient kubernetes.Interface) (int, error) {
-	return currentNodeLocalIDStart(ctx, kubeClient)
 }
 
 type AscendD950 struct {
@@ -138,10 +134,7 @@ func (a *AscendD950) ModifyPod(pod *v1.Pod, pr *podmonitor.PodResource) error {
 	if err != nil {
 		return err
 	}
-	localIDStart, err := d950LocalIDStart(context.Background(), a.kubeClient)
-	if err != nil {
-		return fmt.Errorf("failed to resolve d950 local id start for pod '%v': %w", pr.NamespacedName, err)
-	}
+	localIDStart := d950LocalIDStartFromNodeName(framework.GetEnvs().NodeName)
 	physicalDevices, err := buildPhysicalDevices(ids, localIDStart)
 	if err != nil {
 		return err
@@ -165,11 +158,7 @@ func (a *AscendD950) syncRootInfoConfigMap(ctx context.Context) {
 		return
 	}
 
-	localIDStart, err := d950LocalIDStart(ctx, a.kubeClient)
-	if err != nil {
-		logRootInfoSyncError(err)
-		return
-	}
+	localIDStart := d950LocalIDStartFromNodeName(framework.GetEnvs().NodeName)
 
 	payload, err := buildRootInfoPayload(localIDStart)
 	if err != nil {
@@ -232,6 +221,13 @@ func logRootInfoSyncError(err error) {
 	if err != nil {
 		klog.ErrorS(err, "failed to sync d950 rootinfo ConfigMap")
 	}
+}
+
+func d950LocalIDStartFromNodeName(nodeName string) int {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(nodeName))
+	segmentCount := d950RackCardCount / d950CardCount
+	return int(hasher.Sum32()%uint32(segmentCount)) * d950CardCount
 }
 
 func buildVisibleDevices(deviceIDs []string) (string, error) {
@@ -372,61 +368,4 @@ func validateUniqueRootInfoAddrs(info *rootInfo) error {
 		}
 	}
 	return nil
-}
-
-func currentNodeLocalIDStart(ctx context.Context, kubeClient kubernetes.Interface) (int, error) {
-	if kubeClient == nil {
-		return 0, errors.New("kube client is nil")
-	}
-
-	nodes, err := kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return 0, fmt.Errorf("failed to list nodes: %w", err)
-	}
-
-	nodeName := framework.GetEnvs().NodeName
-	preferred := filterWorkerNodeNames(nodes.Items)
-	idx := indexOfNode(preferred, nodeName)
-	if idx < 0 {
-		all := nodeNames(nodes.Items)
-		idx = indexOfNode(all, nodeName)
-	}
-	if idx < 0 {
-		return 0, fmt.Errorf("node %q not found", nodeName)
-	}
-
-	return (idx * d950CardCount) % d950RackCardCount, nil
-}
-
-func filterWorkerNodeNames(nodes []v1.Node) []string {
-	names := make([]string, 0, len(nodes))
-	for _, node := range nodes {
-		if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
-			continue
-		}
-		if _, ok := node.Labels["node-role.kubernetes.io/master"]; ok {
-			continue
-		}
-		names = append(names, node.Name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func nodeNames(nodes []v1.Node) []string {
-	names := make([]string, 0, len(nodes))
-	for _, node := range nodes {
-		names = append(names, node.Name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func indexOfNode(names []string, nodeName string) int {
-	for idx, name := range names {
-		if name == nodeName {
-			return idx
-		}
-	}
-	return -1
 }
