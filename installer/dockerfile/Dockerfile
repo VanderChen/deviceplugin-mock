@@ -20,7 +20,7 @@ RUN go mod download
 ADD . dpmock
 RUN cd dpmock && make controller && make daemon
 
-FROM alpine:latest
+FROM alpine:3.23.2@sha256:865b95f46d98cf867a156fe4a135ad3fe50d2056aa3f25ed31662dff6da4eb62
 COPY --from=builder /go/src/volcano.sh/dpmock/_output/bin/controller /controller
 COPY --from=builder /go/src/volcano.sh/dpmock/_output/bin/daemon /daemon
 ENTRYPOINT ["/controller"]

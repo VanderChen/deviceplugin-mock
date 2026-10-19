@@ -85,11 +85,11 @@ generate-all: manifests generate client-gen fmt vet ## Run all commands that gen
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) crd webhook paths="./..." output:crd:artifacts:config=${MANIFEST_DIR}
+	$(CONTROLLER_GEN) crd webhook paths="./api/..." output:crd:artifacts:config=${MANIFEST_DIR}
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
-	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./api/..."
 
 .PHONY: client-gen
 client-gen: ## Generate client, lister and informer code by code-generator.
