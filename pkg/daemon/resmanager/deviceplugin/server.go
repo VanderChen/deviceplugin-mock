@@ -24,6 +24,7 @@ import (
 	"os"
 	"path"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
@@ -49,14 +50,20 @@ type server struct {
 
 func NewDpServer(resourceName string, endpoint string) Server {
 	return &server{
-		resourceName: resourceName,
-		endpoint:     endpoint,
-		deviceIDs:    NewListMonitor[string](),
+		resourceName:   resourceName,
+		endpoint:       endpoint,
+		deviceIDs:      NewListMonitor[string](),
+		kubeletConnEvt: make(chan any, 1),
 	}
 }
 
 func (s *server) Serve(ctx context.Context) error {
-	s.kubeletConnEvt = make(chan any, 1)
+	// A channel belongs to the server, not an individual Serve attempt: an old
+	// ListAndWatch handler may still finish while the next attempt is starting.
+	select {
+	case <-s.kubeletConnEvt:
+	default:
+	}
 
 	if _, err := os.Stat(s.endpoint); err == nil {
 		if err = os.Remove(s.endpoint); err != nil {
@@ -86,21 +93,19 @@ func (s *server) Serve(ctx context.Context) error {
 
 	s.registerDevicePluginServer(grpcServer)
 
-	var errCh chan error
+	errCh := make(chan error, 1)
 	go func() {
-		err = grpcServer.Serve(sock)
-		if err != nil {
-			errCh <- err
-			close(errCh)
-		}
+		errCh <- grpcServer.Serve(sock)
 	}()
 
 	if err = s.registerToKubelet(ctx); err != nil {
 		return fmt.Errorf("failed to register to kubelet: %w", err)
 	}
 	defer func() {
-		if e := s.deregister(framework.ContextOnExit()); e != nil {
-			klog.ErrorS(err, "failed to deregister from kubelet", "resource", s.resourceName)
+		cleanupCtx, cancel := context.WithTimeout(framework.ContextOnExit(), 5*time.Second)
+		defer cancel()
+		if e := s.deregister(cleanupCtx); e != nil {
+			klog.ErrorS(e, "failed to deregister from kubelet", "resource", s.resourceName)
 		}
 	}()
 

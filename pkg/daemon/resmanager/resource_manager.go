@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 	"sigs.k8s.io/yaml"
@@ -70,26 +72,34 @@ func (m *resourceManager) Run(ctx context.Context) {
 	klog.V(3).InfoS("resource manager start", "resourceName", m.resourceName)
 	defer klog.V(3).InfoS("resource manager end", "resourceName", m.resourceName)
 
-	go wait.UntilWithContext(ctx, func(ctx context.Context) {
-		if err := m.dpServer.Serve(ctx); err != nil {
-			klog.ErrorS(err, "dp server terminated with error", "resourceName", m.resourceName)
-		}
-	}, 5*time.Second)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		wait.UntilWithContext(ctx, func(ctx context.Context) {
+			if err := m.dpServer.Serve(ctx); err != nil {
+				klog.ErrorS(err, "dp server terminated with error", "resourceName", m.resourceName)
+			}
+		}, 5*time.Second)
+	}()
 
-	go wait.UntilWithContext(ctx, func(ctx context.Context) {
-		if m.synchronized.Load() {
-			return
-		}
+	go func() {
+		defer workers.Done()
+		wait.UntilWithContext(ctx, func(ctx context.Context) {
+			if m.synchronized.Load() {
+				return
+			}
 
-		m.synchronized.Store(true)
-		if err := m.syncConfigOnce(ctx); err != nil {
-			klog.ErrorS(err, "sync config once failed", "resourceName", m.resourceName)
-			m.synchronized.Store(false)
-		}
-	}, time.Second)
+			m.synchronized.Store(true)
+			if err := m.syncConfigOnce(ctx); err != nil {
+				klog.ErrorS(err, "sync config once failed", "resourceName", m.resourceName)
+				m.synchronized.Store(false)
+			}
+		}, time.Second)
+	}()
 
 	<-ctx.Done()
-
+	workers.Wait() // No old Serve/deregister/patch may race the next manager.
 	m.onExit()
 }
 
@@ -123,15 +133,17 @@ func (m *resourceManager) syncConfigOnce(ctx context.Context) error {
 }
 
 func (m *resourceManager) onExit() {
+	ctx, cancel := context.WithTimeout(framework.ContextOnExit(), 20*time.Second)
+	defer cancel()
 	desc := m.desc.Load()
 	if desc != nil && desc.NodeUndoPatch != "" {
-		if err := patchToNode(framework.ContextOnExit(), []byte(desc.NodeUndoPatch)); err != nil {
+		if err := patchToNode(ctx, []byte(desc.NodeUndoPatch)); err != nil {
 			klog.ErrorS(err, "resource undo patch to node failed", "resourceName", m.resourceName, "undoPatch", desc.NodeUndoPatch)
 		} else {
 			klog.V(3).InfoS("resource undo patch to node success", "resourceName", m.resourceName, "undoPatch", desc.NodeUndoPatch)
 		}
 	}
-	if err := ensureNodeStatusResourceRemoved(framework.ContextOnExit(), m.resourceName); err != nil {
+	if err := ensureNodeStatusResourceRemoved(ctx, m.resourceName); err != nil {
 		klog.ErrorS(err, "resource cleanup from node status failed", "resourceName", m.resourceName)
 	}
 }
@@ -155,39 +167,49 @@ func patchToNode(ctx context.Context, patch []byte) error {
 
 func ensureNodeStatusResourceRemoved(ctx context.Context, resourceName string) error {
 	return wait.PollUntilContextTimeout(ctx, time.Second, 15*time.Second, true, func(ctx context.Context) (bool, error) {
-		if _, err := CleanupNodeStatusResource(ctx, resourceName); err != nil {
+		absent, err := CleanupNodeStatusResource(ctx, resourceName)
+		if err != nil {
 			klog.ErrorS(err, "failed to patch node status for resource cleanup", "resourceName", resourceName)
 			return false, nil
 		}
 
-		node, err := framework.GetClientSet().KubeClient.CoreV1().Nodes().Get(ctx, framework.GetEnvs().NodeName, metav1.GetOptions{})
-		if err != nil {
-			klog.ErrorS(err, "failed to get node while checking resource cleanup", "resourceName", resourceName)
-			return false, nil
-		}
-		_, capacityExists := node.Status.Capacity[corev1.ResourceName(resourceName)]
-		_, allocatableExists := node.Status.Allocatable[corev1.ResourceName(resourceName)]
-		return !capacityExists && !allocatableExists, nil
+		return absent, nil
 	})
 }
 
 func CleanupNodeStatusResource(ctx context.Context, resourceName string) (bool, error) {
+	return CleanupNodeStatusResourceWithClient(ctx, framework.GetClientSet().KubeClient, framework.GetEnvs().NodeName, resourceName)
+}
+
+// CleanupNodeStatusResourceWithClient only patches resources that still exist.
+func CleanupNodeStatusResourceWithClient(ctx context.Context, client kubernetes.Interface, nodeName, resourceName string) (bool, error) {
+	nodes := client.CoreV1().Nodes()
+	node, err := nodes.Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	if nodeResourceAbsent(node, resourceName) {
+		return true, nil
+	}
 	patch, err := buildNodeStatusResourceRemovedPatch(resourceName)
 	if err != nil {
 		return false, err
 	}
-	if _, err = framework.GetClientSet().KubeClient.CoreV1().Nodes().
-		Patch(ctx, framework.GetEnvs().NodeName, types.MergePatchType, patch, metav1.PatchOptions{}, "status"); err != nil {
+	if _, err = nodes.Patch(ctx, nodeName, types.MergePatchType, patch, metav1.PatchOptions{}, "status"); err != nil {
 		return false, err
 	}
 
-	node, err := framework.GetClientSet().KubeClient.CoreV1().Nodes().Get(ctx, framework.GetEnvs().NodeName, metav1.GetOptions{})
+	node, err = nodes.Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		return false, err
 	}
+	return nodeResourceAbsent(node, resourceName), nil
+}
+
+func nodeResourceAbsent(node *corev1.Node, resourceName string) bool {
 	_, capacityExists := node.Status.Capacity[corev1.ResourceName(resourceName)]
 	_, allocatableExists := node.Status.Allocatable[corev1.ResourceName(resourceName)]
-	return !capacityExists && !allocatableExists, nil
+	return !capacityExists && !allocatableExists
 }
 
 func buildNodeStatusResourceRemovedPatch(resourceName string) ([]byte, error) {

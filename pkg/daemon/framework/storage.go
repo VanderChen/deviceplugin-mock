@@ -52,6 +52,9 @@ func (s *Storage) Get(name string) (any, bool) {
 func (s *Storage) Set(name string, object any) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+	if s.data == nil {
+		s.data = make(map[string]any)
+	}
 
 	s.data[name] = object
 }

@@ -18,10 +18,13 @@ package controller
 
 import (
 	"context"
+	"maps"
 	"sync/atomic"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
@@ -38,11 +41,16 @@ type Controller struct {
 	synchronized   atomic.Bool
 	managers       map[string]resourceManagerWithCancel
 	staleResources map[string]struct{}
+	kubeClient     kubernetes.Interface
+	newManager     func(string) resmanager.ResourceManager
 }
 
 type resourceManagerWithCancel struct {
 	resmanager.ResourceManager
-	Cancel context.CancelFunc
+	Cancel   context.CancelFunc
+	Done     <-chan struct{}
+	Profile  string
+	Stopping bool
 }
 
 func init() {
@@ -72,7 +80,19 @@ func (c *Controller) KubeClientInit(clientSet framework.ClientSet) error {
 		return err
 	}
 
-	return nil
+	_, err = clientSet.KubeInformerFactory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    notifySyncCfg.AddFunc,
+		DeleteFunc: notifySyncCfg.DeleteFunc,
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			// Most status changes do not affect selection. A retired mock resource
+			// reappearing from kubelet's checkpoint does require another cleanup.
+			oldNode, newNode := oldObj.(*v1.Node), newObj.(*v1.Node)
+			if !maps.Equal(oldNode.Labels, newNode.Labels) || oldNode.Annotations[ManagedResourcesKey] != newNode.Annotations[ManagedResourcesKey] || hasRetiredResource(newNode) {
+				c.synchronized.Store(false)
+			}
+		},
+	})
+	return err
 }
 
 func (c *Controller) Initialize() error {
@@ -81,6 +101,8 @@ func (c *Controller) Initialize() error {
 	c.staleResources = make(map[string]struct{})
 
 	clientSet := framework.GetClientSet()
+	c.kubeClient = clientSet.KubeClient
+	c.newManager = resmanager.New
 	c.nodeLister = clientSet.KubeInformerFactory.Core().V1().Nodes().Lister()
 	c.nrcfgLister = clientSet.DpmockInformerFactory.Dpmock().V1alpha1().NodeResourceConfigurations().Lister()
 

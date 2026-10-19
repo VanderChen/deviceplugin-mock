@@ -39,7 +39,10 @@ func (s *server) ListAndWatch(_ *pluginapi.Empty, server grpc.ServerStreamingSer
 	klog.V(3).InfoS("kubelet list and watch start", "resource", s.resourceName)
 	defer func() {
 		klog.V(3).InfoS("kubelet list and watch end", "resource", s.resourceName)
-		s.kubeletConnEvt <- struct{}{}
+		select {
+		case s.kubeletConnEvt <- struct{}{}:
+		default:
+		}
 	}()
 
 	s.deviceIDs.ListAndWatch(server.Context(), func(list []string) {
