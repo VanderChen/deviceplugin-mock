@@ -25,6 +25,9 @@ type Envs struct {
 	NodeName     string
 	NodeIP       string
 	PodNamespace string
+	PodName      string
+	PodUID       string
+	Instance     string
 }
 
 var envs Envs
@@ -46,6 +49,9 @@ func initializeEnvironment() error {
 	envs.NodeName = nodeName
 	envs.NodeIP = nodeIP
 	envs.PodNamespace = os.Getenv("POD_NAMESPACE")
+	envs.PodName = os.Getenv("POD_NAME")
+	envs.PodUID = os.Getenv("POD_UID")
+	envs.Instance = os.Getenv("DPMOCK_INSTANCE")
 
 	return nil
 }

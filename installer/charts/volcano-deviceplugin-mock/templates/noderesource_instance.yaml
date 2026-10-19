@@ -72,9 +72,7 @@ spec:
         {{- end }}
         volcano.sh/device-topologys: '{"topologys":[{"type":"HCCS","groups":{{ toJson $hccs_list }}}]}'` }}
   defaultNodeUndoPatch: |
-    metadata:
-      annotations:
-        volcano.sh/device-topologys: null
+    {{- include "volcano-deviceplugin-mock.ascend1980UndoPatch" . | nindent 4 }}
 ---
 apiVersion: dpmock.volcano.sh/v1alpha1
 kind: NodeResource
@@ -95,9 +93,7 @@ spec:
         {{- $hccs_list := join "," $num_list | list }}
         volcano.sh/device-topologys: '{"topologys":[{"type":"HCCS","groups":{{ toJson $hccs_list }}}]}'` }}
   defaultNodeUndoPatch: |
-    metadata:
-      annotations:
-        volcano.sh/device-topologys: null
+    {{- include "volcano-deviceplugin-mock.ascend1980UndoPatch" . | nindent 4 }}
 ---
 apiVersion: dpmock.volcano.sh/v1alpha1
 kind: NodeResource
@@ -112,19 +108,9 @@ spec:
     delimiter: ""
     ordinalStart: 0
   defaultNodePatchTemplate: |
-    metadata:
-      annotations:{{ `
-        {{- $num_list := atoi .capacity | until }}
-        {{- $hccs_list := join "," $num_list | list }}
-        {{- $sio_list := list }}
-        {{- range $i, $e := chunk 2 $num_list }}
-        {{- $sio_list = join "," $e | append $sio_list }}
-        {{- end }}
-        volcano.sh/device-topologys: '{"topologys":[{"type":"HCCS","groups":{{ toJson $hccs_list }}},{"type":"SIO","groups":{{ toJson $sio_list }}}]}'` }}
+    {{- include "volcano-deviceplugin-mock.ascendHCCSAndSIOPatch" . | nindent 4 }}
   defaultNodeUndoPatch: |
-    metadata:
-      annotations:
-        volcano.sh/device-topologys: null
+    {{- include "volcano-deviceplugin-mock.ascend1980UndoPatch" . | nindent 4 }}
 ---
 apiVersion: dpmock.volcano.sh/v1alpha1
 kind: NodeResource
@@ -139,19 +125,9 @@ spec:
     delimiter: ""
     ordinalStart: 0
   defaultNodePatchTemplate: |
-    metadata:
-      annotations:{{ `
-        {{- $num_list := atoi .capacity | until }}
-        {{- $hccs_list := join "," $num_list | list }}
-        {{- $sio_list := list }}
-        {{- range $i, $e := chunk 2 $num_list }}
-        {{- $sio_list = join "," $e | append $sio_list }}
-        {{- end }}
-        volcano.sh/device-topologys: '{"topologys":[{"type":"HCCS","groups":{{ toJson $hccs_list }}},{"type":"SIO","groups":{{ toJson $sio_list }}}]}'` }}
+    {{- include "volcano-deviceplugin-mock.ascendHCCSAndSIOPatch" . | nindent 4 }}
   defaultNodeUndoPatch: |
-    metadata:
-      annotations:
-        volcano.sh/device-topologys: null
+    {{- include "volcano-deviceplugin-mock.ascend1980UndoPatch" . | nindent 4 }}
 ---
 apiVersion: dpmock.volcano.sh/v1alpha1
 kind: NodeResource

@@ -18,9 +18,10 @@ package ascend
 
 import (
 	"context"
-	"errors"
+	"encoding/hex"
 	"fmt"
 	"hash/fnv"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -41,8 +44,8 @@ import (
 const (
 	d950CardCount               = 8
 	d950RackCardCount           = 64
-	d950RootInfoKey             = "rootinfo.json"
-	d950RootInfoConfigMapPrefix = "rootinfo-"
+	d950RootInfoKey             = "hccl_rootinfo.json"
+	d950RootInfoConfigMapPrefix = "root-info-"
 	visibleDevicesKey           = "huawei.com/ascend-visible-devices"
 	ascendRealPhyIDKey          = "huawei.com/AscendRealPhyID"
 )
@@ -50,12 +53,15 @@ const (
 var d950 = &AscendD950{}
 
 var d950ConfigActive = func() bool {
-	return activeConfigReferencesNodeResource("ascend-d950")
+	return activeMockSpec() == "ascend-d950"
 }
 
 type AscendD950 struct {
-	Enabled    bool
-	kubeClient kubernetes.Interface
+	Enabled         bool
+	kubeClient      kubernetes.Interface
+	cleanupIdentity string
+	cleanupPending  bool
+	inactiveClean   bool
 }
 
 type rootInfo struct {
@@ -95,8 +101,15 @@ func (a *AscendD950) Name() string {
 }
 
 func (a *AscendD950) Initialize() error {
+	a.Enabled = false
+	a.inactiveClean = false
+	a.cleanupIdentity = ""
 	if framework.GetEnvs().PodNamespace == "" {
-		return errors.New("env 'POD_NAMESPACE' not set")
+		klog.Warning("POD_NAMESPACE is unset; disabling optional D950 service")
+		return nil
+	}
+	if framework.GetEnvs().PodName == "" || framework.GetEnvs().PodUID == "" {
+		klog.Warning("POD_NAME/POD_UID are unset; D950 will use label-based cleanup without a Pod ownerReference")
 	}
 	a.Enabled = true
 	a.kubeClient = framework.GetClientSet().KubeClient
@@ -104,6 +117,10 @@ func (a *AscendD950) Initialize() error {
 }
 
 func (a *AscendD950) Run(ctx context.Context) error {
+	if !a.Enabled {
+		<-ctx.Done()
+		return framework.ErrContextDone
+	}
 	wait.UntilWithContext(ctx, a.syncRootInfoConfigMap, 30*time.Second)
 	return framework.ErrContextDone
 }
@@ -132,12 +149,12 @@ func (a *AscendD950) ModifyPod(pod *v1.Pod, pr *podmonitor.PodResource) error {
 	idsJoin := strings.Join(ids, ",")
 	visibleDevices, err := buildVisibleDevices(ids)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to build visible devices for pod '%v' (device IDs %v): %w", pr.NamespacedName, ids, err)
 	}
 	localIDStart := d950LocalIDStartFromNodeName(framework.GetEnvs().NodeName)
 	physicalDevices, err := buildPhysicalDevices(ids, localIDStart)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to build physical devices for pod '%v' (device IDs %v): %w", pr.NamespacedName, ids, err)
 	}
 
 	if pod.Annotations == nil {
@@ -153,77 +170,147 @@ func (a *AscendD950) ModifyPod(pod *v1.Pod, pr *podmonitor.PodResource) error {
 }
 
 func (a *AscendD950) syncRootInfoConfigMap(ctx context.Context) {
+	if !a.Enabled {
+		return
+	}
+	if err := a.reconcileRootInfo(ctx); err != nil {
+		envs := framework.GetEnvs()
+		klog.ErrorS(err, "failed to sync d950 rootinfo ConfigMap", "namespace", envs.PodNamespace, "node", envs.NodeName, "nodeIP", envs.NodeIP)
+	}
+}
+
+func (a *AscendD950) reconcileRootInfo(ctx context.Context) error {
+	// The services start concurrently. An unread configuration is not an
+	// inactive configuration and must not trigger deletion during startup.
+	if _, ready := activeNodeResourceConfiguration(); !ready {
+		return nil
+	}
+	envs := framework.GetEnvs()
+	name := rootInfoConfigMapName(envs.NodeIP)
+	if name == "" {
+		return fmt.Errorf("invalid node IP %q", envs.NodeIP)
+	}
+	identity := envs.PodNamespace + "/" + name + "/" + envs.PodUID + "/" + envs.Instance
+	if identity != a.cleanupIdentity {
+		a.cleanupIdentity = identity
+		a.cleanupPending = true
+		a.inactiveClean = false
+	}
 	if !d950ConfigActive() {
-		a.deleteRootInfoConfigMap(ctx)
-		return
+		if a.inactiveClean {
+			return nil
+		}
+		if err := a.deleteRootInfoConfigMaps(ctx, ""); err != nil {
+			return err
+		}
+		a.inactiveClean = true
+		a.cleanupPending = true
+		return nil
 	}
-
-	localIDStart := d950LocalIDStartFromNodeName(framework.GetEnvs().NodeName)
-
-	payload, err := buildRootInfoPayload(localIDStart)
+	a.inactiveClean = false
+	payload, err := buildRootInfoPayload(d950LocalIDStartFromNodeName(envs.NodeName))
 	if err != nil {
-		logRootInfoSyncError(err)
-		return
+		return err
 	}
-
-	name := rootInfoConfigMapName(framework.GetEnvs().NodeIP)
-	namespace := framework.GetEnvs().PodNamespace
 	desired := &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: namespace,
+			Namespace: envs.PodNamespace,
 			Labels:    rootInfoLabels(),
 		},
 		Data: map[string]string{
 			d950RootInfoKey: payload,
 		},
 	}
-
-	cmClient := a.kubeClient.CoreV1().ConfigMaps(namespace)
+	if envs.PodName != "" && envs.PodUID != "" {
+		controller := true
+		desired.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: envs.PodName, UID: types.UID(envs.PodUID), Controller: &controller}}
+	}
+	cmClient := a.kubeClient.CoreV1().ConfigMaps(envs.PodNamespace)
 	current, err := cmClient.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		if _, err = cmClient.Create(ctx, desired, metav1.CreateOptions{}); err != nil {
-			logRootInfoSyncError(err)
+			return fmt.Errorf("create %s: %w", name, err)
 		}
-		return
+	} else {
+		if err != nil {
+			return fmt.Errorf("get %s: %w", name, err)
+		}
+		if !ownsRootInfo(current) {
+			return fmt.Errorf("refusing to update ConfigMap %s with a different owner", name)
+		}
+		updated := current.DeepCopy()
+		for key, value := range desired.Labels {
+			updated.Labels[key] = value
+		}
+		if updated.Data == nil {
+			updated.Data = make(map[string]string)
+		}
+		updated.Data[d950RootInfoKey] = payload
+		if len(desired.OwnerReferences) > 0 {
+			refs := updated.OwnerReferences[:0]
+			for _, ref := range updated.OwnerReferences {
+				if ref.Controller == nil || !*ref.Controller {
+					refs = append(refs, ref)
+				}
+			}
+			updated.OwnerReferences = append(refs, desired.OwnerReferences...)
+		}
+		if !equality.Semantic.DeepEqual(current, updated) {
+			if _, err := cmClient.Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+				return fmt.Errorf("update %s: %w", name, err)
+			}
+		}
 	}
-	if err != nil {
-		logRootInfoSyncError(err)
-		return
+	// Reconcile the desired object before removing historical node-IP names.
+	if a.cleanupPending {
+		if err := a.deleteRootInfoConfigMaps(ctx, name); err != nil {
+			return err
+		}
+		a.cleanupPending = false
 	}
-
-	if equality.Semantic.DeepEqual(current.Data, desired.Data) && equality.Semantic.DeepEqual(current.Labels, desired.Labels) {
-		return
-	}
-
-	updated := current.DeepCopy()
-	updated.Labels = desired.Labels
-	updated.Data = desired.Data
-	if _, err = cmClient.Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
-		logRootInfoSyncError(err)
-	}
+	return nil
 }
 
-func (a *AscendD950) deleteRootInfoConfigMap(ctx context.Context) {
-	name := rootInfoConfigMapName(framework.GetEnvs().NodeIP)
-	namespace := framework.GetEnvs().PodNamespace
-	err := a.kubeClient.CoreV1().ConfigMaps(namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	if apierrors.IsNotFound(err) {
-		return
-	}
+func (a *AscendD950) deleteRootInfoConfigMaps(ctx context.Context, keep string) error {
+	selector := labels.Set{
+		"app.kubernetes.io/component": "daemon",
+		"dpmock.volcano.sh/node-name": framework.GetEnvs().NodeName,
+		"dpmock.volcano.sh/mock-spec": "ascend-d950",
+	}.AsSelector().String()
+	client := a.kubeClient.CoreV1().ConfigMaps(framework.GetEnvs().PodNamespace)
+	list, err := client.List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
-		logRootInfoSyncError(err)
+		return fmt.Errorf("list historical rootinfo ConfigMaps: %w", err)
 	}
+	for i := range list.Items {
+		cm := &list.Items[i]
+		if cm.Name == keep || !ownsRootInfo(cm) || !strings.HasPrefix(cm.Name, d950RootInfoConfigMapPrefix) {
+			continue
+		}
+		uid := cm.UID
+		if err := client.Delete(ctx, cm.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete historical ConfigMap %s: %w", cm.Name, err)
+		}
+	}
+	return nil
 }
 
-func logRootInfoSyncError(err error) {
-	// Keep rootinfo failures visible without stopping the daemon service loop.
-	if err != nil {
-		klog.ErrorS(err, "failed to sync d950 rootinfo ConfigMap")
+func ownsRootInfo(cm *v1.ConfigMap) bool {
+	envs := framework.GetEnvs()
+	if cm.Labels["app.kubernetes.io/component"] != "daemon" || cm.Labels["dpmock.volcano.sh/node-name"] != envs.NodeName || cm.Labels["dpmock.volcano.sh/mock-spec"] != "ascend-d950" {
+		return false
 	}
+	if instance := cm.Labels["app.kubernetes.io/instance"]; instance != "" && instance != envs.Instance {
+		return false
+	}
+	owner := metav1.GetControllerOf(cm)
+	return owner == nil || (owner.APIVersion == "v1" && owner.Kind == "Pod" && (cm.Labels["app.kubernetes.io/instance"] != "" || owner.UID == types.UID(envs.PodUID)))
 }
 
 func d950LocalIDStartFromNodeName(nodeName string) int {
+	// Mock-only local segments may repeat across nodes. Do not reintroduce a
+	// cluster-wide Node List on the per-pod annotation path to make them unique.
 	hasher := fnv.New32a()
 	_, _ = hasher.Write([]byte(nodeName))
 	segmentCount := d950RackCardCount / d950CardCount
@@ -263,17 +350,30 @@ func deviceIndexFromID(id string) (int, error) {
 }
 
 func rootInfoConfigMapName(nodeIP string) string {
-	return d950RootInfoConfigMapPrefix + nodeIP
+	addr, err := netip.ParseAddr(nodeIP)
+	if err != nil || addr.Zone() != "" {
+		return ""
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return d950RootInfoConfigMapPrefix + addr.String()
+	}
+	bb := addr.As16()
+	return d950RootInfoConfigMapPrefix + "v6-" + hex.EncodeToString(bb[:])
 }
 
 func rootInfoLabels() map[string]string {
-	return map[string]string{
+	result := map[string]string{
 		"app.kubernetes.io/component": "daemon",
 		"dpmock.volcano.sh/node-name": framework.GetEnvs().NodeName,
 		"dpmock.volcano.sh/mock-spec": "ascend-d950",
 		"ring-controller.cce":         "ascend-1980",
 		"volcano.sh/config-type":      "root-info",
 	}
+	if instance := framework.GetEnvs().Instance; instance != "" {
+		result["app.kubernetes.io/instance"] = instance
+	}
+	return result
 }
 
 func buildRootInfoPayload(localIDStart int) (string, error) {

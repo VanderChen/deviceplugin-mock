@@ -99,7 +99,11 @@ func sortDeviceIDs(ids []string) {
 		iIdx, iErr := strconv.Atoi(strings.TrimPrefix(ids[i], devPrefix))
 		jIdx, jErr := strconv.Atoi(strings.TrimPrefix(ids[j], devPrefix))
 		if iErr == nil && jErr == nil {
-			return iIdx < jIdx
+			if iIdx != jIdx {
+				return iIdx < jIdx
+			}
+		} else if (iErr == nil) != (jErr == nil) {
+			return iErr == nil
 		}
 		return ids[i] < ids[j]
 	})

@@ -5,6 +5,27 @@ Expand the name of the chart.
 {{- default .Chart.Name .Release.Name | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
+{{/* Compatibility mock for D910C/D950; this does not claim physical D950 wiring. */}}
+{{- define "volcano-deviceplugin-mock.ascendHCCSAndSIOPatch" -}}
+metadata:
+  annotations:{{ `
+    {{- $num_list := atoi .capacity | until }}
+    {{- $hccs_list := join "," $num_list | list }}
+    {{- $sio_list := list }}
+    {{- range $i, $e := chunk 2 $num_list }}
+    {{- $sio_list = join "," $e | append $sio_list }}
+    {{- end }}
+    volcano.sh/device-topologys: '{"topologys":[{"type":"HCCS","groups":{{ toJson $hccs_list }}},{"type":"SIO","groups":{{ toJson $sio_list }}}]}'` }}
+{{- end }}
+
+{{- define "volcano-deviceplugin-mock.ascend1980UndoPatch" -}}
+metadata:
+  annotations:
+    volcano.sh/device-topologys: null
+    huawei.com/ascend-1980-status: null
+    huawei.com/ascend-status: null
+{{- end }}
+
 {{- define "volcano-deviceplugin-mock.controller.name" -}}
 {{ include "volcano-deviceplugin-mock.name" . }}-controller
 {{- end }}

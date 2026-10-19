@@ -17,22 +17,31 @@ limitations under the License.
 package ascend
 
 import (
+	"strings"
 	dpmockv1alpha1 "volcano.sh/deviceplugin-mock/api/dpmock/v1alpha1"
 	"volcano.sh/deviceplugin-mock/pkg/daemon/controller"
 	"volcano.sh/deviceplugin-mock/pkg/daemon/framework"
 )
 
-func activeConfigReferencesNodeResource(name string) bool {
+// activeMockSpec centralizes precedence. Mixed Ascend profiles are unsupported;
+// retain D950 precedence and the legacy D910 fallback for direct resources.
+func activeMockSpec() string {
 	nrcfg, ok := activeNodeResourceConfiguration()
 	if !ok {
-		return false
+		return ""
 	}
+	profile := ""
 	for _, resource := range nrcfg.Spec.Resources {
-		if resource.ResourceRef != nil && resource.ResourceRef.Name == name {
-			return true
+		if ref := resource.ResourceRef; ref != nil && strings.HasPrefix(ref.Name, "ascend-") {
+			if ref.Name == "ascend-d950" {
+				return ref.Name
+			}
+			profile = ref.Name
+		} else if resource.ResourceName == resourceName && profile == "" {
+			profile = "ascend-d910"
 		}
 	}
-	return false
+	return profile
 }
 
 func activeNodeResourceConfiguration() (*dpmockv1alpha1.NodeResourceConfiguration, bool) {
@@ -41,5 +50,5 @@ func activeNodeResourceConfiguration() (*dpmockv1alpha1.NodeResourceConfiguratio
 		return nil, false
 	}
 	nrcfg, ok := obj.(*dpmockv1alpha1.NodeResourceConfiguration)
-	return nrcfg, ok
+	return nrcfg, ok && nrcfg != nil
 }

@@ -84,7 +84,7 @@ func (a *AscendD910) ModifyPod(pod *v1.Pod, pr *podmonitor.PodResource) error {
 	if !a.Enabled {
 		return nil
 	}
-	if activeConfigReferencesNodeResource("ascend-d950") {
+	if !strings.HasPrefix(activeMockSpec(), "ascend-d910") {
 		return nil
 	}
 

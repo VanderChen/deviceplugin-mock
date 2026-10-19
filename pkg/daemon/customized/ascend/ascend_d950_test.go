@@ -33,6 +33,7 @@ import (
 )
 
 func TestAscendD950ModifyPod(t *testing.T) {
+	preserveAscendTestState(t)
 	framework.GetEnvs().NodeName = "kind-worker2"
 	framework.GetEnvs().NodeIP = "192.168.7.100"
 	d950.Enabled = true
@@ -79,13 +80,30 @@ func TestAscendD950ModifyPod(t *testing.T) {
 		t.Fatalf("annotation %s = %q, want %q", ascendRealPhyIDKey, got, want)
 	}
 
-	wantNetworkInfo := `{"pod_name":"deployment1-6c49f95d74-kswdl","server_id":"192.168.7.100","devices":[{"device_id":"0","super_device_id":"10000","device_ip":"100.0.0.0","tor_ip":"200.0.0.0","tor_port":"8888"},{"device_id":"1","super_device_id":"10000","device_ip":"100.0.0.1","tor_ip":"200.0.0.1","tor_port":"8888"}]}`
-	if got := pod.Annotations[annotationKey]; got != wantNetworkInfo {
-		t.Fatalf("annotation %s = %q, want %q", annotationKey, got, wantNetworkInfo)
+	var info PodNetworkInfo
+	if err := json.Unmarshal([]byte(pod.Annotations[annotationKey]), &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.PodName != pr.Name || info.ServerID != "192.168.7.100" {
+		t.Fatalf("unexpected pod/server identity: %+v", info)
+	}
+	wantDevices := []DeviceNetworkInfo{
+		{DeviceID: "0", SuperDeviceID: "10000", DeviceIP: "100.0.0.0", TorIP: "200.0.0.0", TorPort: "8888"},
+		{DeviceID: "1", SuperDeviceID: "10000", DeviceIP: "100.0.0.1", TorIP: "200.0.0.1", TorPort: "8888"},
+	}
+	if len(info.Devices) != len(wantDevices) {
+		t.Fatalf("device count = %d, want %d", len(info.Devices), len(wantDevices))
+	}
+	for i, want := range wantDevices {
+		got := info.Devices[i]
+		if got.DeviceID != want.DeviceID || got.SuperDeviceID != want.SuperDeviceID || got.DeviceIP != want.DeviceIP || got.TorIP != want.TorIP || got.TorPort != want.TorPort {
+			t.Fatalf("device %d = %+v, want contract fields %+v", i, got, want)
+		}
 	}
 }
 
 func TestAscendD950DoesNotListNodesForPodAnnotations(t *testing.T) {
+	preserveAscendTestState(t)
 	framework.GetEnvs().NodeName = "kind-worker2"
 	framework.GetEnvs().NodeIP = "192.168.7.100"
 	client := fake.NewSimpleClientset(
@@ -132,6 +150,7 @@ func TestAscendD950DoesNotListNodesForPodAnnotations(t *testing.T) {
 }
 
 func TestBuildRootInfoPayload(t *testing.T) {
+	preserveAscendTestState(t)
 	payload, err := buildRootInfoPayload(16)
 	if err != nil {
 		t.Fatalf("buildRootInfoPayload() error = %v", err)
@@ -167,6 +186,7 @@ func TestBuildRootInfoPayload(t *testing.T) {
 }
 
 func TestAscendD950SyncRootInfoConfigMap(t *testing.T) {
+	preserveAscendTestState(t)
 	framework.GetEnvs().NodeName = "kind-worker"
 	framework.GetEnvs().NodeIP = "172.18.0.2"
 	framework.GetEnvs().PodNamespace = "volcano-system"
@@ -184,7 +204,7 @@ func TestAscendD950SyncRootInfoConfigMap(t *testing.T) {
 	}()
 	svc.syncRootInfoConfigMap(context.Background())
 
-	cm, err := client.CoreV1().ConfigMaps("volcano-system").Get(context.Background(), "rootinfo-172.18.0.2", metav1.GetOptions{})
+	cm, err := client.CoreV1().ConfigMaps("volcano-system").Get(context.Background(), "root-info-172.18.0.2", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get rootinfo ConfigMap: %v", err)
 	}
@@ -221,14 +241,16 @@ func TestAscendD950SyncRootInfoConfigMap(t *testing.T) {
 }
 
 func TestAscendD950DeletesRootInfoConfigMapWhenInactive(t *testing.T) {
+	preserveAscendTestState(t)
 	framework.GetEnvs().NodeName = "kind-worker"
 	framework.GetEnvs().NodeIP = "172.18.0.2"
 	framework.GetEnvs().PodNamespace = "volcano-system"
 
 	client := fake.NewSimpleClientset(&v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "rootinfo-172.18.0.2",
+			Name:      "root-info-172.18.0.2",
 			Namespace: "volcano-system",
+			Labels:    rootInfoLabels(),
 		},
 		Data: map[string]string{
 			d950RootInfoKey: "{}",
@@ -243,13 +265,14 @@ func TestAscendD950DeletesRootInfoConfigMapWhenInactive(t *testing.T) {
 
 	svc.syncRootInfoConfigMap(context.Background())
 
-	_, err := client.CoreV1().ConfigMaps("volcano-system").Get(context.Background(), "rootinfo-172.18.0.2", metav1.GetOptions{})
+	_, err := client.CoreV1().ConfigMaps("volcano-system").Get(context.Background(), "root-info-172.18.0.2", metav1.GetOptions{})
 	if err == nil {
 		t.Fatalf("rootinfo ConfigMap still exists after inactive D950 sync")
 	}
 }
 
 func TestD950LocalIDStartFromNodeName(t *testing.T) {
+	preserveAscendTestState(t)
 	for _, name := range []string{"kind-worker", "kind-worker2", "node-08", ""} {
 		got := d950LocalIDStartFromNodeName(name)
 		if got < 0 || got >= d950RackCardCount {
