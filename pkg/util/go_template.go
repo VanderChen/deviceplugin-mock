@@ -19,7 +19,7 @@ package util
 import (
 	"html/template"
 
-	sprig "github.com/go-task/slim-sprig/v3"
+	sprig "github.com/Masterminds/sprig/v3"
 )
 
 func GoTemplateParse(text string) (*template.Template, error) {
