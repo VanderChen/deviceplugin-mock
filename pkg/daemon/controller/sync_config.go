@@ -128,7 +128,10 @@ func (c *Controller) applyConfig(ctx context.Context, nrcfg *dpmockv1alpha1.Node
 	for i, desc := range nrcfg.Status.ResourceDescriptions {
 		resDescMap[desc.ResourceName] = &desc
 		if i < len(nrcfg.Spec.Resources) {
-			identity, _ := json.Marshal(nrcfg.Spec.Resources[i].ResourceInfo)
+			identity, err := json.Marshal(nrcfg.Spec.Resources[i].ResourceInfo)
+			if err != nil {
+				return fmt.Errorf("marshal resource identity for nrcfg %s resource %s: %w", nrcfg.Name, desc.ResourceName, err)
+			}
 			profiles[desc.ResourceName] = string(identity)
 		}
 	}
@@ -207,7 +210,15 @@ func (c *Controller) applyConfig(ctx context.Context, nrcfg *dpmockv1alpha1.Node
 		if fresh.Annotations[ManagedResourcesKey] != node.Annotations[ManagedResourcesKey] {
 			return errors.New("managed-resources changed concurrently; retry")
 		}
-		patch, _ := json.Marshal(map[string]any{"metadata": map[string]any{"resourceVersion": fresh.ResourceVersion, "annotations": map[string]string{ManagedResourcesKey: string(data)}}})
+		patch, err := json.Marshal(map[string]any{
+			"metadata": map[string]any{
+				"resourceVersion": fresh.ResourceVersion,
+				"annotations":     map[string]string{ManagedResourcesKey: string(data)},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("marshal managed-resources patch for node %s: %w", nodeName, err)
+		}
 		if _, err := c.kubeClient.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 			return err
 		}

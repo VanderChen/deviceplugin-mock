@@ -18,9 +18,10 @@ package ascend
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -311,10 +312,9 @@ func ownsRootInfo(cm *v1.ConfigMap) bool {
 func d950LocalIDStartFromNodeName(nodeName string) int {
 	// Mock-only local segments may repeat across nodes. Do not reintroduce a
 	// cluster-wide Node List on the per-pod annotation path to make them unique.
-	hasher := fnv.New32a()
-	_, _ = hasher.Write([]byte(nodeName))
+	digest := sha256.Sum256([]byte(nodeName))
 	segmentCount := d950RackCardCount / d950CardCount
-	return int(hasher.Sum32()%uint32(segmentCount)) * d950CardCount
+	return int(binary.BigEndian.Uint32(digest[:4])%uint32(segmentCount)) * d950CardCount
 }
 
 func buildVisibleDevices(deviceIDs []string) (string, error) {
